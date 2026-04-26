@@ -1,0 +1,48 @@
+# ======================
+# ROS2 Workspace
+# ======================
+ssl_robot_ws/build/
+ssl_robot_ws/install/
+ssl_robot_ws/log/
+
+# Colcon
+ssl_robot_ws/.colcon/
+ssl_robot_ws/src/ssl_ros_bridge/
+
+# ======================
+# Simulator (grSim)
+# ======================
+grSim/
+
+# ======================
+# General
+# ======================
+__pycache__/
+*.pyc
+*.pyo
+*.o
+*.so
+*.a
+
+# Logs
+*.log
+
+# Temp
+*.swp
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+
+# ======================
+# Optional
+# ======================
+# PDFs (large, not needed usually)
+*.pdf
+
+# Notes
+cep_roadmap.txt
