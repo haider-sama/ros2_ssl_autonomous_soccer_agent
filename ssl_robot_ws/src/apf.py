@@ -1,9 +1,14 @@
 import math
 
+# Note: the RHO_0 and K_REP values need to adjusted carefully, 
+# the robot bounces hard back and avoids the obstacles but 
+# it needs a good combo of both of the values in order to get a 
+# consistent result. TODO: Fix local minima problem in this file
+
 K_ATT     = 4.0
 D_STAR    = 1.0
-K_REP     = 2.0
-RHO_0     = 0.4
+K_REP     = 6.0
+RHO_0     = 0.25
 N_NEAREST = 7
 
 def compute_apf(rx, ry, tx, ty, obstacles, max_vel=1.8):

@@ -11,7 +11,7 @@ from packet import build_packet
 from apf    import compute_apf
 
 
-# ── Configuration ─────────────────────────────────────────────────
+# Configuration
 
 ROBOT_ID   = 0
 TEAM       = 'blue'
@@ -24,6 +24,64 @@ MAX_OMEGA = 6.0
 MAX_VEL   = 1.8    # m/s
 STOP_DIST = 0.15   # stop when this close to ball (m)
 
+APPROACH_DIST =  0.25     # how far behind ball to position (meters)
+
+CIRCLE_RADIUS = 0.4   # tune based on robot speed/acceleration
+
+def compute_shoot_target(rx, ry, bx, by, goal_pos, offset=APPROACH_DIST, r=CIRCLE_RADIUS):
+    gx, gy = goal_pos
+
+    # Compute true shooting direction: ball → goal
+    dx_g = gx - bx
+    dy_g = gy - by
+    dist_g = math.hypot(dx_g, dy_g)
+    if dist_g < 1e-6:
+        return bx, by  # degenerate case: ball is on top of goal
+
+    su = dx_g / dist_g   # was hardcoded 1.0
+    sv = dy_g / dist_g   # was hardcoded 0.0
+
+    # Target position: behind ball, opposite to shoot direction
+    target_x = bx - su * offset
+    target_y = by - sv * offset
+
+    # Robot offset from ball
+    dx = rx - bx
+    dy = ry - by
+
+    # Project onto shoot axis and perpendicular
+    along = dx * su + dy * sv        # positive = behind ball (correct side)
+    perp  = dx * (-sv) + dy * su    # side offset
+
+    # Check if robot is already in the approach cone (behind ball, close to axis)
+    if along < 0 and abs(perp) < r:
+        # Robot is on correct side and close to shoot line — go directly
+        return target_x, target_y
+
+    # Two circle centers: offset perpendicular from ball on each side
+    c1x = bx + (-sv) * r
+    c1y = by + su * r
+    c2x = bx - (-sv) * r
+    c2y = by - su * r
+
+    # Pick the circle on the same side as robot
+    if perp >= 0:
+        cx, cy = c1x, c1y
+    else:
+        cx, cy = c2x, c2y
+
+    # Navigate to tangent point: point on circle closest to target
+    # direction from circle center to target
+    ctx = target_x - cx
+    cty = target_y - cy
+    ctd = math.hypot(ctx, cty)
+    if ctd < 1e-6:
+        return target_x, target_y
+
+    # Arc waypoint: circle center + r * unit(center→target)
+    arc_x = cx + (ctx / ctd) * r
+    arc_y = cy + (cty / ctd) * r
+    return arc_x, arc_y
 
 class BallTrackerNode(Node):
 
@@ -32,7 +90,7 @@ class BallTrackerNode(Node):
 
         self._sock      = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._is_yellow = (TEAM == 'yellow')
-
+    
         self.create_subscription(
             VisionWrapper,
             '/ssl_vision_bridge/vision_messages',
@@ -45,12 +103,16 @@ class BallTrackerNode(Node):
         self._yaw       = 0.0
         self._obstacles = []
 
+        self._prev_ball      = None
+        self._prev_ball_time = None
+        self._ball_vel       = (0.0, 0.0)
+
         self.create_timer(0.02, self._control_loop)
         self.get_logger().info(
             f'Phase 3 APF ready — team={TEAM} robot_id={ROBOT_ID}'
         )
 
-    # ── Vision callback ───────────────────────────────────────────
+    # Vision callback
     def _vision_cb(self, msg: VisionWrapper):
         if not msg.detection:
             return
@@ -59,6 +121,18 @@ class BallTrackerNode(Node):
         our_robots      = {}
         opp_robots      = {}
 
+        # if msg.geometry:
+        #     geom = msg.geometry[0].field
+        #     field_length = geom.field_length
+        #     field_width  = geom.field_width
+        #     goal_width   = geom.goal_width
+
+        #     self._goal_x = field_length / 2.0
+        #     self._goal_y = 0.0
+        #     self.get_logger().info(
+        #             f'Field: {field_length}x{field_width}m | Goal center: ({self._goal_x}, 0.0)'
+        #     )
+            
         for frame in msg.detection:
             for b in frame.balls:
                 ball_candidates.append((b.confidence, b.pos.x, b.pos.y))
@@ -86,7 +160,23 @@ class BallTrackerNode(Node):
 
         if ball_candidates:
             best = max(ball_candidates, key=lambda x: x[0])
-            self._ball = (best[1], best[2])
+            new_ball = (best[1], best[2])
+            now = self.get_clock().now().nanoseconds * 1e-9
+
+            if self._prev_ball is not None and self._prev_ball_time is not None:
+                dt = now - self._prev_ball_time
+                if dt > 0.005:                          # ignore duplicate frames
+                    alpha = 0.4                         # EMA smoothing factor
+                    raw_vx = (new_ball[0] - self._prev_ball[0]) / dt
+                    raw_vy = (new_ball[1] - self._prev_ball[1]) / dt
+                    self._ball_vel = (
+                        alpha * raw_vx + (1 - alpha) * self._ball_vel[0],
+                        alpha * raw_vy + (1 - alpha) * self._ball_vel[1],
+                    )
+
+            self._prev_ball      = new_ball
+            self._prev_ball_time = now
+            self._ball           = new_ball
 
         if ROBOT_ID in our_robots:
             _, x, y, yaw = our_robots[ROBOT_ID]
@@ -98,36 +188,48 @@ class BallTrackerNode(Node):
         if new_obs:
             self._obstacles = new_obs
 
-    # ── Control loop ─────────────────────────────────────────────
+    # Control loop
     def _control_loop(self):
         if self._ball is None or self._robot is None:
             self.get_logger().info(
                 'Waiting for vision...', throttle_duration_sec=2.0)
             return
 
-        bx, by = self._ball
-        rx, ry = self._robot
+        bx, by   = self._ball
+        vbx, vby = self._ball_vel
 
+        rx, ry   = self._robot
+        dist_now = math.hypot(bx - rx, by - ry)
+        t_intercept = min(dist_now / max(MAX_VEL, 0.1), 0.6)    # cap lookahead
+
+        bx_raw, by_raw = self._ball         # save raw ball position
+        bx = bx_raw + vbx * t_intercept     # predicted position for target computation
+        by = by_raw + vby * t_intercept
+
+        GOAL_POS = (6.0, 0.0)
+        gx, gy = GOAL_POS
+        tx, ty = compute_shoot_target(rx, ry, bx, by, goal_pos=GOAL_POS)
+        
         dist = math.hypot(bx - rx, by - ry)
 
         if dist < STOP_DIST:
             self._send(0.0, 0.0, 0.0)
             return
 
-        vx_w, vy_w = compute_apf(rx, ry, bx, by, self._obstacles, max_vel=MAX_VEL)
-        
-
-        angle_to_ball = math.atan2(by - ry, bx - rx)
-        ang_err = normalize_angle(angle_to_ball - self._yaw)
+        vx_w, vy_w = compute_apf(rx, ry, tx, ty, self._obstacles, max_vel=MAX_VEL)
+    
+        theta_shoot = math.atan2(gy - by, gx - bx)
+        ang_err = normalize_angle(theta_shoot - self._yaw)
         omega = clamp(KP_ANG * ang_err, MAX_OMEGA)
 
         vt, vn = world_to_robot(vx_w, vy_w, self._yaw)
         self._send(vt, vn, omega)
 
+
         self.get_logger().info(
-            f'ball=({bx:.2f},{by:.2f}) robot=({rx:.2f},{ry:.2f}) '
-            f'dist={dist:.2f} vt={vt:.2f} vn={vn:.2f} '
-            f'obs={len(self._obstacles)}',
+            f'ball=({bx:.2f},{by:.2f}) target=({tx:.2f},{ty:.2f}) '
+            f'robot=({rx:.2f},{ry:.2f}) dist={dist:.2f} '
+            f'vt={vt:.2f} vn={vn:.2f} obs={len(self._obstacles)}',
             throttle_duration_sec=0.5
         )
 
