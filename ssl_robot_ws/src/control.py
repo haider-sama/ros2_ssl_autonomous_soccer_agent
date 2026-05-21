@@ -21,67 +21,14 @@ GRSIM_PORT = 20011
 
 KP_ANG    = 4.0
 MAX_OMEGA = 6.0
-MAX_VEL   = 1.8    # m/s
-STOP_DIST = 0.15   # stop when this close to ball (m)
+MAX_VEL   = 2.5    # m/s
+STOP_DIST = 0.15  # stop when this close to ball (m)
 
-APPROACH_DIST =  0.25     # how far behind ball to position (meters)
+GOAL_POS      = (6.0, 0.0)    # 12x9m field
+ALIGN_DIST    = 0.22          # orbit radius around ball (m); slightly > STOP_DIST
+ANG_ALIGN_TOL = 0.10          # rad aligned when |ang_err_to_goal| < this
 
-CIRCLE_RADIUS = 0.4   # tune based on robot speed/acceleration
-
-def compute_shoot_target(rx, ry, bx, by, goal_pos, offset=APPROACH_DIST, r=CIRCLE_RADIUS):
-    gx, gy = goal_pos
-
-    # Compute true shooting direction: ball → goal
-    dx_g = gx - bx
-    dy_g = gy - by
-    dist_g = math.hypot(dx_g, dy_g)
-    if dist_g < 1e-6:
-        return bx, by  # degenerate case: ball is on top of goal
-
-    su = dx_g / dist_g   # was hardcoded 1.0
-    sv = dy_g / dist_g   # was hardcoded 0.0
-
-    # Target position: behind ball, opposite to shoot direction
-    target_x = bx - su * offset
-    target_y = by - sv * offset
-
-    # Robot offset from ball
-    dx = rx - bx
-    dy = ry - by
-
-    # Project onto shoot axis and perpendicular
-    along = dx * su + dy * sv        # positive = behind ball (correct side)
-    perp  = dx * (-sv) + dy * su    # side offset
-
-    # Check if robot is already in the approach cone (behind ball, close to axis)
-    if along < 0 and abs(perp) < r:
-        # Robot is on correct side and close to shoot line — go directly
-        return target_x, target_y
-
-    # Two circle centers: offset perpendicular from ball on each side
-    c1x = bx + (-sv) * r
-    c1y = by + su * r
-    c2x = bx - (-sv) * r
-    c2y = by - su * r
-
-    # Pick the circle on the same side as robot
-    if perp >= 0:
-        cx, cy = c1x, c1y
-    else:
-        cx, cy = c2x, c2y
-
-    # Navigate to tangent point: point on circle closest to target
-    # direction from circle center to target
-    ctx = target_x - cx
-    cty = target_y - cy
-    ctd = math.hypot(ctx, cty)
-    if ctd < 1e-6:
-        return target_x, target_y
-
-    # Arc waypoint: circle center + r * unit(center→target)
-    arc_x = cx + (ctx / ctd) * r
-    arc_y = cy + (cty / ctd) * r
-    return arc_x, arc_y
+KD_ANG = 0.05
 
 class BallTrackerNode(Node):
 
@@ -90,7 +37,7 @@ class BallTrackerNode(Node):
 
         self._sock      = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._is_yellow = (TEAM == 'yellow')
-    
+
         self.create_subscription(
             VisionWrapper,
             '/ssl_vision_bridge/vision_messages',
@@ -101,15 +48,23 @@ class BallTrackerNode(Node):
         self._ball      = None
         self._robot     = None
         self._yaw       = 0.0
-        self._obstacles = []
+        self._obstacle_map = {}
+        
+        self._state = 'APPROACH_BALL'
+        self._align_stable_count = 0 
 
         self._prev_ball      = None
         self._prev_ball_time = None
         self._ball_vel       = (0.0, 0.0)
 
+        # Add these for PD control (derivative terms need previous error):
+        self._prev_dist_err  = 0.0   # previous distance error for translational D term
+        self._prev_ang_err   = 0.0   # previous angular error for angular D term
+        self._prev_time      = None  # timestamp of last control loop call
+
         self.create_timer(0.02, self._control_loop)
         self.get_logger().info(
-            f'Phase 3 APF ready — team={TEAM} robot_id={ROBOT_ID}'
+            f'ready — team={TEAM} robot_id={ROBOT_ID}'
         )
 
     # Vision callback
@@ -183,55 +138,173 @@ class BallTrackerNode(Node):
             self._robot = (x, y)
             self._yaw   = yaw
 
-        # only update obstacles when opponents are actually detected
-        new_obs = [(v[1], v[2]) for v in opp_robots.values()]
-        if new_obs:
-            self._obstacles = new_obs
+        now_t = self.get_clock().now().nanoseconds * 1e-9
+        for rid, v in opp_robots.items():
+            self._obstacle_map[rid] = (v[1], v[2], now_t)
+
+        # Expire robots not seen for more than 1 second
+        self._obstacle_map = {
+            rid: val for rid, val in self._obstacle_map.items()
+            if now_t - val[2] < 1.0
+        }
+        self._obstacles = [(val[0], val[1]) for val in self._obstacle_map.values()]
 
     # Control loop
     def _control_loop(self):
         if self._ball is None or self._robot is None:
-            self.get_logger().info(
-                'Waiting for vision...', throttle_duration_sec=2.0)
+            self.get_logger().info('Waiting for vision...', throttle_duration_sec=2.0)
             return
 
         bx, by   = self._ball
-        vbx, vby = self._ball_vel
-
         rx, ry   = self._robot
-        dist_now = math.hypot(bx - rx, by - ry)
-        t_intercept = min(dist_now / max(MAX_VEL, 0.1), 0.6)    # cap lookahead
+        now      = self.get_clock().now().nanoseconds * 1e-9
 
-        bx_raw, by_raw = self._ball         # save raw ball position
-        bx = bx_raw + vbx * t_intercept     # predicted position for target computation
-        by = by_raw + vby * t_intercept
-
-        GOAL_POS = (6.0, 0.0)
-        gx, gy = GOAL_POS
-        tx, ty = compute_shoot_target(rx, ry, bx, by, goal_pos=GOAL_POS)
-        
-        dist = math.hypot(bx - rx, by - ry)
-
-        if dist < STOP_DIST:
-            self._send(0.0, 0.0, 0.0)
+        # dt for derivative terms — skip first frame
+        if self._prev_time is None:
+            self._prev_time = now
             return
+        dt = now - self._prev_time
+        if dt < 1e-6:
+            return
+        self._prev_time = now
 
-        vx_w, vy_w = compute_apf(rx, ry, tx, ty, self._obstacles, max_vel=MAX_VEL)
-    
-        theta_shoot = math.atan2(gy - by, gx - bx)
-        ang_err = normalize_angle(theta_shoot - self._yaw)
-        omega = clamp(KP_ANG * ang_err, MAX_OMEGA)
+        # ── Translational PD ──────────────────────────────────────────────────
+        # APF gives us the world-frame velocity vector toward the ball (+ obstacle repulsion)
+        # We treat the APF output magnitude as our proportional control signal.
+        # The D term damps it using the rate of change of distance error.
+
+        dist_err         = math.hypot(bx - rx, by - ry)   # how far from ball
+        d_dist_err       = (dist_err - self._prev_dist_err) / dt
+        self._prev_dist_err = dist_err
+
+        if dist_err < STOP_DIST and self._state == 'APPROACH_BALL':
+            self._align_stable_count += 1
+            if self._align_stable_count >= 25:   # ~0.5s of stable holding before aligning
+                self._state = 'ALIGN'
+                self._align_stable_count = 0
+                self.get_logger().info('→ ALIGN')
+            else:
+                self._send(0.0, 0.0, 0.0)
+                self.get_logger().info('AT BALL — holding', throttle_duration_sec=1.0)
+                return
+
+        # APF computes direction + proportional magnitude in world frame
+        nearby = [o for o in self._obstacles if math.hypot(rx - o[0], ry - o[1]) < 2.0]
+        
+        if self._state == 'ALIGN':
+            if dist_err > STOP_DIST * 2:
+                self._state = 'APPROACH_BALL'
+                self._align_stable_count = 0
+                self.get_logger().info('Ball moved — back to APPROACH_BALL')
+
+        gx, gy = GOAL_POS
+        shoot_dx = gx - bx
+        shoot_dy = gy - by
+        shoot_d  = math.hypot(shoot_dx, shoot_dy)
+        shoot_ux = shoot_dx / max(shoot_d, 1e-6)
+        shoot_uy = shoot_dy / max(shoot_d, 1e-6)
+        # Behind-ball point: directly opposite goal on shoot axis
+        apf_tx = bx - shoot_ux * ALIGN_DIST
+        apf_ty = by - shoot_uy * ALIGN_DIST
+
+        if self._state == 'ALIGN':
+            robot_behind_check = (rx - bx) * (-shoot_ux) + (ry - by) * (-shoot_uy) > 0.05
+            if not robot_behind_check:
+                # Reposition: arc around ball using tangential waypoint
+                # Robot-from-ball unit vector
+                rbx = (rx - bx) / max(math.hypot(rx - bx, ry - by), 1e-6)
+                rby = (ry - by) / max(math.hypot(rx - bx, ry - by), 1e-6)
+                # Pick tangent direction that goes toward behind-ball point
+                # (whichever 90° rotation reduces angle to apf_t)
+                t1x, t1y = -rby,  rbx   # CCW tangent
+                t2x, t2y =  rby, -rbx   # CW  tangent
+                to_target_x = apf_tx - rx
+                to_target_y = apf_ty - ry
+                dot1 = t1x * to_target_x + t1y * to_target_y
+                dot2 = t2x * to_target_x + t2y * to_target_y
+                tan_x, tan_y = (t1x, t1y) if dot1 > dot2 else (t2x, t2y)
+                # Waypoint: ball + ALIGN_DIST in tangent direction — skirts around ball
+                arc_wx = bx + tan_x * ALIGN_DIST * 1.5
+                arc_wy = by + tan_y * ALIGN_DIST * 1.5
+                vx_w, vy_w = compute_apf(rx, ry, arc_wx, arc_wy, nearby, max_vel=MAX_VEL)
+            else:
+                # Behind ball — drive to hold position behind it
+                vx_w, vy_w = compute_apf(rx, ry, apf_tx, apf_ty, nearby, max_vel=MAX_VEL)
+        else:
+            vx_w, vy_w = compute_apf(rx, ry, bx, by, nearby, max_vel=MAX_VEL)
+
+        # Apply D term: scale back velocity when closing in fast (d_dist_err is negative when approaching)
+        # KD_VEL * d_dist_err is negative when robot is approaching → reduces speed → damps overshoot
+        KD_VEL = 0.15  # derivative gain — increase if robot oscillates near ball
+
+        speed_apf = math.hypot(vx_w, vy_w)
+        if speed_apf > 1e-6:
+            # Compute PD-adjusted speed: APF gives P term, D term subtracts rate of closure
+            pd_speed = speed_apf + KD_VEL * d_dist_err   # d_dist_err < 0 when closing → reduces speed
+            pd_speed = max(0.0, min(pd_speed, MAX_VEL))   # clamp, never reverse from D alone
+            # Reapply direction from APF, magnitude from PD
+            vx_w = (vx_w / speed_apf) * pd_speed
+            vy_w = (vy_w / speed_apf) * pd_speed
 
         vt, vn = world_to_robot(vx_w, vy_w, self._yaw)
-        self._send(vt, vn, omega)
 
+        # ── Angular: face ball (APPROACH) or face goal (ALIGN) ───────────────────
+        if self._state == 'ALIGN':
+            if not robot_behind_check:
+                # Sub-phase 1: reposition to behind-ball point, face the ball
+                theta_ball = math.atan2(by - ry, bx - rx)
+                ang_err    = normalize_angle(theta_ball - self._yaw)
+                d_ang_err  = normalize_angle(ang_err - self._prev_ang_err) / dt
+                self._prev_ang_err = ang_err
+                omega = clamp(KP_ANG * ang_err + KD_ANG * d_ang_err, MAX_OMEGA)
+                self._align_stable_count = 0
+                self._send(vt, vn, omega)
+                self.get_logger().info(
+                    f'[ALIGN:reposition] ball=({bx:.2f},{by:.2f}) robot=({rx:.2f},{ry:.2f}) '
+                    f'dist={dist_err:.2f} ang_err={math.degrees(ang_err):.1f}°',
+                    throttle_duration_sec=0.5
+                )
+            else:
+                # Sub-phase 2: behind ball confirmed — rotate to face goal
+                theta_goal = math.atan2(gy - by, gx - bx)
+                ang_err    = normalize_angle(theta_goal - self._yaw)
+                d_ang_err  = normalize_angle(ang_err - self._prev_ang_err) / dt
+                self._prev_ang_err = ang_err
+                omega = clamp(KP_ANG * ang_err + KD_ANG * d_ang_err, MAX_OMEGA)
 
-        self.get_logger().info(
-            f'ball=({bx:.2f},{by:.2f}) target=({tx:.2f},{ty:.2f}) '
-            f'robot=({rx:.2f},{ry:.2f}) dist={dist:.2f} '
-            f'vt={vt:.2f} vn={vn:.2f} obs={len(self._obstacles)}',
-            throttle_duration_sec=0.5
-        )
+                if abs(ang_err) < ANG_ALIGN_TOL:
+                    self._align_stable_count += 1
+                    if self._align_stable_count >= 10:
+                        self._send(0.0, 0.0, 0.0)
+                        self._state = 'APPROACH_BALL'
+                        self._align_stable_count = 0
+                        self.get_logger().info('ALIGNED ✓ — returning to hold')
+                        return
+                else:
+                    self._align_stable_count = 0
+
+                self._send(vt, vn, omega)
+                self.get_logger().info(
+                    f'[ALIGN:rotate] ball=({bx:.2f},{by:.2f}) robot=({rx:.2f},{ry:.2f}) '
+                    f'dist={dist_err:.2f} ang_err={math.degrees(ang_err):.1f}° '
+                    f'{"ALIGNED ✓" if abs(ang_err) < ANG_ALIGN_TOL else "rotating..."}',
+                    throttle_duration_sec=0.5
+                )
+        else:
+            # ── Angular PD: face ball during approach ─────────────────────────
+            theta_ball = math.atan2(by - ry, bx - rx)
+            ang_err    = normalize_angle(theta_ball - self._yaw)
+            d_ang_err  = normalize_angle(ang_err - self._prev_ang_err) / dt
+            self._prev_ang_err = ang_err
+            omega  = clamp(KP_ANG * ang_err + KD_ANG * d_ang_err, MAX_OMEGA)
+
+            self._send(vt, vn, omega)
+            self.get_logger().info(
+                f'[APPROACH_BALL] ball=({bx:.2f},{by:.2f}) robot=({rx:.2f},{ry:.2f}) '
+                f'dist={dist_err:.2f} pd_speed={pd_speed:.2f} ang_err={math.degrees(ang_err):.1f}° '
+                f'obs={len(nearby)}',
+                throttle_duration_sec=0.5
+            )
 
 
     def _send(self, vt, vn, omega, kickspeedx=0.0):
