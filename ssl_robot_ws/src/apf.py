@@ -4,7 +4,7 @@ import math
 K_ATT     = 4.0
 D_STAR    = 1.0
 K_REP     = 6.0
-RHO_0     = 0.25
+RHO_0     = 0.20
 N_NEAREST = 7
 K_TAN = 3.0 
 

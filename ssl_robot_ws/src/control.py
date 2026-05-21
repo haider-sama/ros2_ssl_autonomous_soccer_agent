@@ -30,6 +30,8 @@ ANG_ALIGN_TOL = 0.10          # rad aligned when |ang_err_to_goal| < this
 
 KD_ANG = 0.05
 
+KICK_SPEED = 6.0   # m/s — grSim kick speed
+
 class BallTrackerNode(Node):
 
     def __init__(self):
@@ -188,10 +190,30 @@ class BallTrackerNode(Node):
                 self.get_logger().info('AT BALL — holding', throttle_duration_sec=1.0)
                 return
 
+        if self._state == 'READY':
+            if dist_err > STOP_DIST * 2:
+                self._state = 'APPROACH_BALL'
+                self._align_stable_count = 0
+                self.get_logger().info('Ball moved — resetting to APPROACH_BALL')
+            else:
+                # Drive into ball with kicker armed
+                kick_ux = (bx - rx) / max(dist_err, 1e-6)
+                kick_uy = (by - ry) / max(dist_err, 1e-6)
+                vt_kick, vn_kick = world_to_robot(kick_ux * MAX_VEL, kick_uy * MAX_VEL, self._yaw)
+                self._send(vt_kick, vn_kick, 0.0, kickspeedx=KICK_SPEED)
+                self.get_logger().info('KICK_BALL — firing!', throttle_duration_sec=0.2)
+                # Once ball leaves (dist grows), reset to approach
+                if dist_err > STOP_DIST * 3:
+                    self._state = 'APPROACH_BALL'
+                    self._align_stable_count = 0
+                    self.get_logger().info('Ball kicked — resetting to APPROACH_BALL')
+                return
+            
+        
         # APF computes direction + proportional magnitude in world frame
         nearby = [o for o in self._obstacles if math.hypot(rx - o[0], ry - o[1]) < 2.0]
         
-        if self._state == 'ALIGN':
+        if self._state in ('ALIGN', 'READY'):
             if dist_err > STOP_DIST * 2:
                 self._state = 'APPROACH_BALL'
                 self._align_stable_count = 0
@@ -276,7 +298,7 @@ class BallTrackerNode(Node):
                     self._align_stable_count += 1
                     if self._align_stable_count >= 10:
                         self._send(0.0, 0.0, 0.0)
-                        self._state = 'APPROACH_BALL'
+                        self._state = 'READY'
                         self._align_stable_count = 0
                         self.get_logger().info('ALIGNED ✓ — returning to hold')
                         return
