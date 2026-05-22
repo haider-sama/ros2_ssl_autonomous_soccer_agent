@@ -371,6 +371,12 @@ class BallTrackerNode(Node):
         for rid, v in opp_robots.items():
             self._obstacle_map[rid] = (v[1], v[2], now_t)
 
+        # Add teammates as obstacles too (excluding self)
+        for rid, v in our_robots.items():
+            if rid == ROBOT_ID:
+                continue
+            self._obstacle_map[rid] = (v[1], v[2], now_t)
+            
         # Expire robots not seen for more than 1 second
         self._obstacle_map = {
             rid: val for rid, val in self._obstacle_map.items()
