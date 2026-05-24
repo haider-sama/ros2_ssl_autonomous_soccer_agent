@@ -41,8 +41,3 @@ Thumbs.db
 # ======================
 # Optional
 # ======================
-# PDFs (large, not needed usually)
-*.pdf
-
-# Notes
-cep_roadmap.txt
