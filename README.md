@@ -7,6 +7,9 @@ A ROS 2-based autonomous striker for the RoboCup SSL simulation environment (grS
 
 ---
 
+<strong>Demo:</strong> [Watch demo video](https://drive.google.com/file/d/1uI_IxuzODIZjKPOrIM5jjYpK-uJ9CHf0/view?usp=sharing)
+
+
 ## Package Structure
 
 ```
